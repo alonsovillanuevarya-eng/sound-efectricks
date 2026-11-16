@@ -1,0 +1,554 @@
+#include "CrystalEngine.h"
+#include <cmath>
+
+void CrystalEngine::prepare (double sampleRate, int, int channels)
+{
+    sr = sampleRate;
+    bufferLength = juce::jmax (4096, (int) std::ceil (sr * 3.0));
+    delayBuffer.setSize (juce::jmax (2, channels), bufferLength);
+    reset();
+}
+
+void CrystalEngine::reset()
+{
+    delayBuffer.clear();
+    writePosition = 0;
+    phase = 0.0;
+}
+
+void CrystalEngine::setParameters (float mix, float feedback, float pitchSemitones,
+                                   float grainMs, float spread, bool reverse)
+{
+    wet = juce::jlimit (0.0f, 1.0f, mix);
+    fb = juce::jlimit (0.0f, 0.92f, feedback);
+    pitch = juce::jlimit (-24.0f, 24.0f, pitchSemitones);
+    grain = juce::jlimit (25.0f, 500.0f, grainMs);
+    stereoSpread = juce::jlimit (0.0f, 1.0f, spread);
+    reverseGrains = reverse;
+}
+
+float CrystalEngine::readLinear (int channel, double position) const
+{
+    const int c = juce::jlimit (0, delayBuffer.getNumChannels() - 1, channel);
+    while (position < 0.0) position += bufferLength;
+    while (position >= bufferLength) position -= bufferLength;
+    const int i0 = (int) position;
+    const int i1 = (i0 + 1) % bufferLength;
+    const float frac = (float) (position - i0);
+    return delayBuffer.getSample (c, i0) * (1.0f - frac)
+         + delayBuffer.getSample (c, i1) * frac;
+}
+
+void CrystalEngine::writeSample (int channel, float value)
+{
+    const int c = juce::jlimit (0, delayBuffer.getNumChannels() - 1, channel);
+    delayBuffer.setSample (c, writePosition, value);
+}
+
+void CrystalEngine::process (juce::AudioBuffer<float>& buffer)
+{
+    if (bufferLength == 0 || wet <= 0.0001f) return;
+
+    const int channels = buffer.getNumChannels();
+    const int samples = buffer.getNumSamples();
+    const double grainSamples = juce::jmax (1.0, sr * (double) grain * 0.001);
+    const double ratio = std::pow (2.0, (double) pitch / 12.0);
+    const double phaseIncrement = 1.0 / grainSamples;
+
+    for (int n = 0; n < samples; ++n)
+    {
+        const float inL = buffer.getSample (0, n);
+        const float inR = channels > 1 ? buffer.getSample (1, n) : inL;
+        float wetL = 0.0f, wetR = 0.0f;
+
+        // Two overlapping Hann-windowed read heads create a continuous grain stream.
+        for (int head = 0; head < 2; ++head)
+        {
+            double p = phase + head * 0.5;
+            p -= std::floor (p);
+            const double window = 0.5 - 0.5 * std::cos (juce::MathConstants<double>::twoPi * p);
+            const double travel = (reverseGrains ? -1.0 : 1.0) * p * grainSamples * (ratio - 1.0);
+            const double baseDelay = grainSamples * 1.15;
+            const double offsetL = baseDelay + travel;
+            const double offsetR = baseDelay + travel + stereoSpread * grainSamples * 0.35;
+            wetL += (float) window * readLinear (0, (double) writePosition - offsetL);
+            wetR += (float) window * readLinear (channels > 1 ? 1 : 0, (double) writePosition - offsetR);
+        }
+
+        wetL *= 0.5f;
+        wetR *= 0.5f;
+        writeSample (0, inL + wetL * fb);
+        if (delayBuffer.getNumChannels() > 1)
+            writeSample (1, inR + wetR * fb);
+
+        buffer.setSample (0, n, inL * (1.0f - wet) + wetL * wet);
+        if (channels > 1)
+            buffer.setSample (1, n, inR * (1.0f - wet) + wetR * wet);
+
+        writePosition = (writePosition + 1) % bufferLength;
+        phase += phaseIncrement;
+        if (phase >= 1.0) phase -= 1.0;
+    }
+}
+
+#pragma once
+#include <JuceHeader.h>
+
+// Original granular pitch-delay inspired by crystal-like pitch echoes.
+// This is not code from Soundtoys Crystallizer.
+class CrystalEngine
+{
+public:
+    void prepare (double sampleRate, int maximumBlockSize, int channels);
+    void reset();
+    void setParameters (float mix, float feedback, float pitchSemitones,
+                        float grainMs, float spread, bool reverse);
+    void process (juce::AudioBuffer<float>& buffer);
+
+private:
+    float readLinear (int channel, double position) const;
+    void writeSample (int channel, float value);
+
+    juce::AudioBuffer<float> delayBuffer;
+    int writePosition = 0;
+    int bufferLength = 0;
+    double sr = 44100.0;
+    float wet = 0.35f, fb = 0.25f, pitch = 12.0f, grain = 120.0f, stereoSpread = 0.35f;
+    bool reverseGrains = false;
+    double phase = 0.0;
+};
+
+#include "PluginEditor.h"
+
+SoundEfectricksAudioProcessorEditor::SoundEfectricksAudioProcessorEditor (SoundEfectricksAudioProcessor& p)
+    : AudioProcessorEditor (&p), processor (p)
+{
+    setSize (1120, 690);
+    title.setText ("SOUND EFECTRICKS", juce::dontSendNotification);
+    title.setFont (juce::Font (juce::FontOptions (30.0f, juce::Font::bold)));
+    title.setColour (juce::Label::textColourId, juce::Colour (0xffe8f4ff));
+    addAndMakeVisible (title);
+    subtitle.setText ("SOUND ERA  /  CREATIVE STEP SEQUENCER", juce::dontSendNotification);
+    subtitle.setColour (juce::Label::textColourId, juce::Colour (0xff7f9aaf));
+    subtitle.setFont (juce::Font (juce::FontOptions (11.0f)));
+    addAndMakeVisible (subtitle);
+    crystalTitle.setText ("CRYSTAL ENGINE", juce::dontSendNotification);
+    crystalTitle.setColour (juce::Label::textColourId, juce::Colour (0xff72e5dc));
+    crystalTitle.setFont (juce::Font (juce::FontOptions (15.0f, juce::Font::bold)));
+    addAndMakeVisible (crystalTitle);
+
+    auto addSlider = [this] (juce::Slider& s, juce::Label& l, const juce::String& name,
+                             const juce::String& id)
+    {
+        configureSlider (s, l, name);
+        attachments.push_back (std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>
+                               (processor.parameters, id, s));
+    };
+    addSlider (mix, mixLabel, "MIX", "mix");
+    addSlider (feedback, feedbackLabel, "FEEDBACK", "feedback");
+    addSlider (pitch, pitchLabel, "PITCH", "pitch");
+    addSlider (grain, grainLabel, "GRAIN", "grain");
+    addSlider (spread, spreadLabel, "SPREAD", "spread");
+    addSlider (cutoff, cutoffLabel, "FILTER", "filterCutoff");
+    addSlider (crush, crushLabel, "CRUSH", "crush");
+    addSlider (stutter, stutterLabel, "STUTTER", "stutter");
+    addSlider (master, masterLabel, "OUTPUT", "master");
+
+    for (int r = 0; r < 8; ++r)
+        for (int s = 0; s < 32; ++s)
+        {
+            auto* b = cells.add (new juce::TextButton());
+            b->setClickingTogglesState (true);
+            b->setToggleState (processor.isStepEnabled (r, s), juce::dontSendNotification);
+            b->onClick = [this, r, s, b]
+            {
+                processor.setStepEnabled (r, s, b->getToggleState());
+            };
+            addAndMakeVisible (b);
+        }
+    startTimerHz (15);
+}
+
+void SoundEfectricksAudioProcessorEditor::configureSlider (juce::Slider& s, juce::Label& l,
+                                                             const juce::String& name)
+{
+    l.setText (name, juce::dontSendNotification);
+    l.setJustificationType (juce::Justification::centred);
+    l.setColour (juce::Label::textColourId, juce::Colour (0xff9eb7c8));
+    l.setFont (juce::Font (juce::FontOptions (10.0f, juce::Font::bold)));
+    addAndMakeVisible (l);
+    s.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
+    s.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 64, 18);
+    s.setColour (juce::Slider::rotarySliderFillColourId, juce::Colour (0xff72e5dc));
+    s.setColour (juce::Slider::thumbColourId, juce::Colour (0xffe8f4ff));
+    s.setColour (juce::Slider::textBoxTextColourId, juce::Colour (0xffdceaf2));
+    s.setColour (juce::Slider::textBoxBackgroundColourId, juce::Colour (0xff17232e));
+    addAndMakeVisible (s);
+}
+
+void SoundEfectricksAudioProcessorEditor::paint (juce::Graphics& g)
+{
+    g.fillAll (juce::Colour (0xff0b1118));
+    g.setColour (juce::Colour (0xff142330));
+    g.fillRoundedRectangle (18.0f, 92.0f, 1084.0f, 385.0f, 12.0f);
+    g.fillRoundedRectangle (18.0f, 493.0f, 1084.0f, 178.0f, 12.0f);
+    g.setColour (juce::Colour (0xff223746));
+    g.drawRoundedRectangle (18.0f, 92.0f, 1084.0f, 385.0f, 12.0f, 1.0f);
+    g.drawRoundedRectangle (18.0f, 493.0f, 1084.0f, 178.0f, 12.0f, 1.0f);
+    g.setColour (juce::Colour (0xff72e5dc));
+    g.drawLine (28.0f, 82.0f, 270.0f, 82.0f, 2.0f);
+    g.setColour (juce::Colour (0xff607d90));
+    g.setFont (11.0f);
+    g.drawText ("32-STEP PATTERN  /  1/16 GRID", 34, 103, 300, 18, juce::Justification::left);
+    g.drawText ("EFFECT LANES", 34, 129, 110, 20, juce::Justification::left);
+    for (int r = 0; r < 8; ++r)
+        g.drawText (rowNames[(size_t) r], 34, 151 + r * 41, 112, 29, juce::Justification::centredLeft);
+    g.drawText ("CRYSTAL: GRANULAR PITCH DELAY", 36, 505, 360, 20, juce::Justification::left);
+}
+
+void SoundEfectricksAudioProcessorEditor::resized()
+{
+    title.setBounds (28, 18, 440, 42);
+    subtitle.setBounds (31, 59, 420, 20);
+    const int gridX = 158, gridY = 151, cellW = 27, cellH = 29, gap = 4, rowGap = 12;
+    for (int r = 0; r < 8; ++r)
+    {
+        for (int s = 0; s < 32; ++s)
+        {
+            auto* b = cells[r * 32 + s];
+            b->setBounds (gridX + s * (cellW + gap), gridY + r * (cellH + rowGap), cellW, cellH);
+            b->setColour (juce::TextButton::buttonColourId,
+                          ((s % 4) == 0) ? juce::Colour (0xff263f4c) : juce::Colour (0xff1a2a35));
+            b->setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xff72e5dc));
+            b->setColour (juce::TextButton::textColourOffId, juce::Colour (0xff7894a5));
+            b->setColour (juce::TextButton::textColourOnId, juce::Colour (0xff071217));
+            b->setButtonText ({});
+        }
+    }
+    // Row labels are drawn in paint; use compact label region by placing labels over the left grid.
+    for (int i = 0; i < 9; ++i) {}
+    const int knobY = 535, knobW = 100, knobH = 112, startX = 35;
+    juce::Slider* sliders[] = { &mix, &feedback, &pitch, &grain, &spread, &cutoff, &crush, &stutter, &master };
+    juce::Label* labels[] = { &mixLabel, &feedbackLabel, &pitchLabel, &grainLabel, &spreadLabel,
+                              &cutoffLabel, &crushLabel, &stutterLabel, &masterLabel };
+    for (int i = 0; i < 9; ++i)
+    {
+        const int x = startX + i * 116;
+        labels[i]->setBounds (x, knobY - 8, knobW, 18);
+        sliders[i]->setBounds (x, knobY + 8, knobW, knobH);
+    }
+    crystalTitle.setBounds (850, 24, 240, 30);
+}
+
+void SoundEfectricksAudioProcessorEditor::timerCallback()
+{
+    const int step = processor.getCurrentStep();
+    for (int r = 0; r < 8; ++r)
+        for (int s = 0; s < 32; ++s)
+        {
+            auto* b = cells[r * 32 + s];
+            b->setColour (juce::TextButton::buttonOnColourId,
+                          s == step ? juce::Colour (0xffffb45b) : juce::Colour (0xff72e5dc));
+        }
+    repaint();
+}
+
+#pragma once
+#include <JuceHeader.h>
+#include "PluginProcessor.h"
+
+class SoundEfectricksAudioProcessorEditor : public juce::AudioProcessorEditor,
+                                            private juce::Timer
+{
+public:
+    explicit SoundEfectricksAudioProcessorEditor (SoundEfectricksAudioProcessor&);
+    ~SoundEfectricksAudioProcessorEditor() override = default;
+    void paint (juce::Graphics&) override;
+    void resized() override;
+
+private:
+    void timerCallback() override;
+    void configureSlider (juce::Slider&, juce::Label&, const juce::String&);
+    SoundEfectricksAudioProcessor& processor;
+    juce::OwnedArray<juce::TextButton> cells;
+    juce::Label title, subtitle, crystalTitle;
+    juce::Slider mix, feedback, pitch, grain, spread, cutoff, crush, stutter, master;
+    juce::Label mixLabel, feedbackLabel, pitchLabel, grainLabel, spreadLabel,
+                cutoffLabel, crushLabel, stutterLabel, masterLabel;
+    std::array<juce::String, 8> rowNames { "STUTTER", "LOOP", "REVERSE", "CRUSH",
+                                          "FILTER", "PHASER", "SPACE", "CRYSTAL" };
+    std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>> attachments;
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SoundEfectricksAudioProcessorEditor)
+};
+
+#include "PluginProcessor.h"
+#include "PluginEditor.h"
+
+SoundEfectricksAudioProcessor::SoundEfectricksAudioProcessor()
+    : AudioProcessor (BusesProperties().withInput ("Input", juce::AudioChannelSet::stereo(), true)
+                                       .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+      parameters (*this, nullptr, "PARAMETERS", createParameterLayout())
+{
+    for (auto& row : pattern)
+        for (auto& step : row) step.store (false);
+
+    // Factory pattern: a few musical events are enabled on the first four rows.
+    for (int s : { 0, 8, 16, 24 }) pattern[0][s].store (true);
+    for (int s : { 4, 12, 20, 28 }) pattern[1][s].store (true);
+    for (int s : { 7, 15, 23, 31 }) pattern[2][s].store (true);
+}
+
+juce::AudioProcessorValueTreeState::ParameterLayout SoundEfectricksAudioProcessor::createParameterLayout()
+{
+    using APF = juce::AudioParameterFloat;
+    using APB = juce::AudioParameterBool;
+    juce::AudioProcessorValueTreeState::ParameterLayout p;
+    p.add (std::make_unique<APF> ("master", "Master", 0.0f, 1.0f, 0.85f));
+    p.add (std::make_unique<APF> ("mix", "Crystal Mix", 0.0f, 1.0f, 0.35f));
+    p.add (std::make_unique<APF> ("feedback", "Crystal Feedback", 0.0f, 0.92f, 0.28f));
+    p.add (std::make_unique<APF> ("pitch", "Crystal Pitch", -24.0f, 24.0f, 12.0f));
+    p.add (std::make_unique<APF> ("grain", "Grain Size", 25.0f, 500.0f, 120.0f));
+    p.add (std::make_unique<APF> ("spread", "Stereo Spread", 0.0f, 1.0f, 0.4f));
+    p.add (std::make_unique<APB> ("reverse", "Reverse Grains", false));
+    p.add (std::make_unique<APF> ("filterCutoff", "Filter Cutoff", 80.0f, 18000.0f, 12000.0f));
+    p.add (std::make_unique<APF> ("crush", "Crush", 0.0f, 1.0f, 0.0f));
+    p.add (std::make_unique<APF> ("stutter", "Stutter", 0.0f, 1.0f, 0.0f));
+    p.add (std::make_unique<APF> ("reverb", "Reverb", 0.0f, 1.0f, 0.12f));
+    return p;
+}
+
+void SoundEfectricksAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
+{
+    sr = sampleRate;
+    crystal.prepare (sr, samplesPerBlock, 2);
+    filterL.reset(); filterR.reset();
+    filterL.prepare ({ sr, (juce::uint32) samplesPerBlock, 1 });
+    filterR.prepare ({ sr, (juce::uint32) samplesPerBlock, 1 });
+    filterL.setType (juce::dsp::StateVariableTPTFilterType::lowpass);
+    filterR.setType (juce::dsp::StateVariableTPTFilterType::lowpass);
+    phaser.prepare ({ sr, (juce::uint32) samplesPerBlock, 2 });
+    phaser.setRate (0.18f);
+    phaser.setDepth (0.55f);
+    phaser.setCentreFrequency (900.0f);
+    phaser.setFeedback (0.25f);
+    phaser.setMix (0.35f);
+    reverb.reset();
+    scratch.setSize (2, samplesPerBlock);
+    fallbackPpq = 0.0;
+}
+
+void SoundEfectricksAudioProcessor::releaseResources() {}
+
+bool SoundEfectricksAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
+{
+    const auto out = layouts.getMainOutputChannelSet();
+    return out == juce::AudioChannelSet::mono() || out == juce::AudioChannelSet::stereo();
+}
+
+bool SoundEfectricksAudioProcessor::isStepEnabled (int row, int step) const
+{
+    if (row < 0 || row >= rows || step < 0 || step >= steps) return false;
+    return pattern[(size_t) row][(size_t) step].load();
+}
+
+void SoundEfectricksAudioProcessor::setStepEnabled (int row, int step, bool enabled)
+{
+    if (row >= 0 && row < rows && step >= 0 && step < steps)
+        pattern[(size_t) row][(size_t) step].store (enabled);
+}
+
+void SoundEfectricksAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
+{
+    juce::ScopedNoDenormals noDenormals;
+    const int numIn = getTotalNumInputChannels();
+    const int numOut = getTotalNumOutputChannels();
+    for (int ch = numIn; ch < numOut; ++ch) buffer.clear (ch, 0, buffer.getNumSamples());
+    if (buffer.getNumChannels() == 0) return;
+
+    double bpm = 120.0, ppq = fallbackPpq;
+    bool playing = false;
+    if (auto* ph = getPlayHead())
+    {
+        if (auto pos = ph->getPosition())
+        {
+            if (auto b = pos->getBpm()) bpm = *b;
+            if (auto q = pos->getPpqPosition()) ppq = *q;
+            playing = pos->getIsPlaying();
+        }
+    }
+    bpm = juce::jlimit (20.0, 300.0, bpm);
+    const double quarterNotesPerStep = 0.25; // sixteenth-note grid
+    const double stepLength = quarterNotesPerStep;
+    const int step = ((int) std::floor (ppq / stepLength)) % steps;
+    currentStep.store (juce::jlimit (0, steps - 1, step));
+
+    // Determine active effects at the block's musical position.
+    std::array<bool, rows> active {};
+    for (int r = 0; r < rows; ++r) active[(size_t) r] = isStepEnabled (r, step);
+
+    const float master = parameters.getRawParameterValue ("master")->load();
+    const float cutoff = parameters.getRawParameterValue ("filterCutoff")->load();
+    const float crush = parameters.getRawParameterValue ("crush")->load();
+    const float stutter = parameters.getRawParameterValue ("stutter")->load();
+    const float mix = parameters.getRawParameterValue ("mix")->load();
+    const float feedback = parameters.getRawParameterValue ("feedback")->load();
+    const float pitch = parameters.getRawParameterValue ("pitch")->load();
+    const float grain = parameters.getRawParameterValue ("grain")->load();
+    const float spread = parameters.getRawParameterValue ("spread")->load();
+    const bool reverse = parameters.getRawParameterValue ("reverse")->load() > 0.5f;
+    const float rev = parameters.getRawParameterValue ("reverb")->load();
+
+    filterL.setCutoffFrequency (cutoff);
+    filterR.setCutoffFrequency (cutoff);
+
+    // Row mapping: STUTTER, LOOP, REVERSE, CRUSH, FILTER, PHASER, SPACE, CRYSTAL.
+    if (active[4])
+    {
+        juce::dsp::AudioBlock<float> block (buffer);
+        juce::dsp::ProcessContextReplacing<float> context (block);
+        if (buffer.getNumChannels() > 1)
+        {
+            auto left = block.getSingleChannelBlock (0);
+            auto right = block.getSingleChannelBlock (1);
+            juce::dsp::ProcessContextReplacing<float> cL (left), cR (right);
+            filterL.process (cL); filterR.process (cR);
+        }
+        else
+        {
+            auto mono = block.getSingleChannelBlock (0);
+            juce::dsp::ProcessContextReplacing<float> c (mono);
+            filterL.process (c);
+        }
+    }
+
+    if (active[5] && buffer.getNumChannels() > 1)
+    {
+        juce::dsp::AudioBlock<float> block (buffer);
+        juce::dsp::ProcessContextReplacing<float> context (block);
+        phaser.process (context);
+    }
+
+    if (active[7])
+    {
+        crystal.setParameters (mix, feedback, pitch, grain, spread, reverse || active[2]);
+        crystal.process (buffer);
+    }
+
+    if (active[3] && crush > 0.001f)
+    {
+        const int bits = juce::jlimit (4, 16, (int) std::round (16.0f - crush * 12.0f));
+        const float levels = (float) (1 << bits);
+        for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
+            for (int n = 0; n < buffer.getNumSamples(); ++n)
+            {
+                const float x = buffer.getSample (ch, n);
+                buffer.setSample (ch, n, std::round (x * levels) / levels);
+            }
+    }
+
+    if (active[6] && rev > 0.001f)
+    {
+        juce::dsp::Reverb::Parameters rp;
+        rp.roomSize = 0.72f; rp.damping = 0.35f; rp.wetLevel = rev;
+        rp.dryLevel = 1.0f - rev * 0.5f; rp.width = 1.0f; rp.freezeMode = 0.0f;
+        reverb.setParameters (rp);
+        reverb.processStereo (buffer.getWritePointer (0),
+                              buffer.getNumChannels() > 1 ? buffer.getWritePointer (1) : buffer.getWritePointer (0),
+                              buffer.getNumSamples());
+    }
+
+    if (active[0] && stutter > 0.001f)
+    {
+        // Short periodic amplitude gates; rate follows a 1/16-step pulse.
+        const int period = juce::jmax (1, (int) (sr * 60.0 / bpm / 4.0));
+        const int gate = juce::jmax (1, (int) (period * (1.0f - stutter * 0.85f)));
+        for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
+            for (int n = 0; n < buffer.getNumSamples(); ++n)
+                if ((n % period) >= gate) buffer.setSample (ch, n, 0.0f);
+    }
+
+    // Reverse/loop rows are sequencer lanes reserved for future buffer-based modes.
+    for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
+        buffer.applyGain (ch, 0, buffer.getNumSamples(), master);
+
+    if (! playing)
+        fallbackPpq += (double) buffer.getNumSamples() / sr * bpm / 60.0;
+}
+
+void SoundEfectricksAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
+{
+    auto state = parameters.copyState();
+    juce::MemoryOutputStream stream (destData, false);
+    state.writeToStream (stream);
+    for (int r = 0; r < rows; ++r)
+        for (int s = 0; s < steps; ++s)
+            stream.writeBool (isStepEnabled (r, s));
+}
+
+void SoundEfectricksAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
+{
+    juce::MemoryInputStream stream (data, (size_t) sizeInBytes, false);
+    auto state = juce::ValueTree::readFromStream (stream);
+    if (state.isValid()) parameters.replaceState (state);
+    for (int r = 0; r < rows; ++r)
+        for (int s = 0; s < steps; ++s)
+            if (! stream.isExhausted()) setStepEnabled (r, s, stream.readBool());
+}
+
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
+{
+    return new SoundEfectricksAudioProcessor();
+}
+
+#pragma once
+#include <JuceHeader.h>
+#include "CrystalEngine.h"
+
+class SoundEfectricksAudioProcessor : public juce::AudioProcessor
+{
+public:
+    SoundEfectricksAudioProcessor();
+    ~SoundEfectricksAudioProcessor() override = default;
+
+    void prepareToPlay (double sampleRate, int samplesPerBlock) override;
+    void releaseResources() override;
+    bool isBusesLayoutSupported (const BusesLayout& layouts) const override;
+    void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
+
+    juce::AudioProcessorEditor* createEditor() override;
+    bool hasEditor() const override { return true; }
+
+    const juce::String getName() const override { return "SOUND EFECTRICKS"; }
+    bool acceptsMidi() const override { return false; }
+    bool producesMidi() const override { return false; }
+    bool isMidiEffect() const override { return false; }
+    double getTailLengthSeconds() const override { return 3.0; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram (int) override {}
+    const juce::String getProgramName (int) override { return {}; }
+    void changeProgramName (int, const juce::String&) override {}
+    void getStateInformation (juce::MemoryBlock&) override;
+    void setStateInformation (const void*, int) override;
+
+    juce::AudioProcessorValueTreeState parameters;
+    static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
+
+    bool isStepEnabled (int row, int step) const;
+    void setStepEnabled (int row, int step, bool enabled);
+    int getCurrentStep() const { return currentStep.load(); }
+
+private:
+    static constexpr int rows = 8, steps = 32;
+    std::array<std::array<std::atomic<bool>, steps>, rows> pattern;
+    std::atomic<int> currentStep { 0 };
+    CrystalEngine crystal;
+    juce::AudioBuffer<float> scratch;
+    juce::dsp::StateVariableTPTFilter<float> filterL, filterR;
+    juce::dsp::Phaser<float> phaser;
+    juce::Reverb reverb;
+    juce::Random random;
+    double sr = 44100.0;
+    double fallbackPpq = 0.0;
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SoundEfectricksAudioProcessor)
+};
